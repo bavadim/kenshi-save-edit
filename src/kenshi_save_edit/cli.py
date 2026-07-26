@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -9,7 +7,7 @@ import struct
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Callable
 
@@ -25,6 +23,8 @@ MAX_MONEY = 2_000_000_000
 MAX_STAT = 100.0
 MIN_RELATION = -100.0
 MAX_RELATION = 100.0
+PACKAGE_NAME = "kenshi-save-edit"
+PACKAGE_VERSION = "0.1.0"
 
 BODY_HEALTH_RATIOS = {
     "3985-gamedata.base": (1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5),
@@ -66,15 +66,6 @@ OFFICIAL_STATS = (
     "poles",
     "sabres",
     "turrets",
-)
-
-SAVE_ROOT_CANDIDATES = (
-    Path.home()
-    / ".steam/steam/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
-    Path.home()
-    / ".steam/debian-installation/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
-    Path.home()
-    / ".local/share/Steam/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
 )
 
 STAT_ALIASES = {
@@ -416,41 +407,25 @@ def parse_relation_assignment(value: str) -> tuple[str, float]:
     return faction, relation
 
 
-def discover_save_root(explicit: str | None) -> Path:
-    if explicit:
-        root = Path(explicit).expanduser().resolve()
-        if not root.is_dir():
-            raise SaveEditError(f"save root does not exist: {root}")
-        return root
-
-    for candidate in SAVE_ROOT_CANDIDATES:
-        if candidate.is_dir():
-            return candidate.resolve()
-
-    searched = "\n  ".join(str(path) for path in SAVE_ROOT_CANDIDATES)
-    raise SaveEditError(f"Kenshi save root not found; searched:\n  {searched}")
-
-
-def validate_save_name(save_name: str) -> None:
-    if not save_name or save_name in {".", ".."}:
-        raise SaveEditError("invalid save name")
-    if Path(save_name).name != save_name:
-        raise SaveEditError("save must be a directory name, not a path")
-
-
-def resolve_save_directory(root: Path, save_name: str) -> Path:
-    validate_save_name(save_name)
-    directory = root / save_name
+def resolve_input_save(value: str) -> Path:
+    directory = Path(value).expanduser().resolve()
     if not directory.is_dir():
-        raise SaveEditError(f"save does not exist: {directory}")
+        raise SaveEditError(f"input save does not exist: {directory}")
     return directory
 
 
-def resolve_new_save_directory(root: Path, save_name: str) -> Path:
-    validate_save_name(save_name)
-    directory = root / save_name
+def resolve_output_save(value: str, input_save: Path) -> Path:
+    directory = Path(value).expanduser().resolve()
+    if directory == input_save:
+        raise SaveEditError("input and output saves must be different directories")
+    if input_save in directory.parents:
+        raise SaveEditError("output save cannot be inside the input save")
     if directory.exists():
-        raise SaveEditError(f"refusing to overwrite existing save: {directory}")
+        raise SaveEditError(f"refusing to overwrite existing output save: {directory}")
+    if not directory.parent.is_dir():
+        raise SaveEditError(
+            f"output save parent does not exist: {directory.parent}"
+        )
     return directory
 
 
@@ -688,29 +663,6 @@ def select_faction_relations(
     return tuple(selected)
 
 
-def find_running_kenshi_processes() -> list[tuple[int, str]]:
-    markers = ("kenshi_x64.exe", "forgotten construction set.exe")
-    matches: list[tuple[int, str]] = []
-    proc = Path("/proc")
-    if not proc.is_dir():
-        return matches
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid == os.getpid():
-            continue
-        try:
-            raw = (entry / "cmdline").read_bytes()
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            continue
-        command = raw.replace(b"\0", b" ").decode("utf-8", errors="ignore").strip()
-        lowered = command.lower()
-        if command and any(marker in lowered for marker in markers):
-            matches.append((pid, command))
-    return matches
-
-
 def character_identity(character: CharacterStats) -> tuple[Path, str]:
     return character.platoon.path, character.record.string_id
 
@@ -744,12 +696,11 @@ def characters_in_platoons(
 
 
 def command_list(
-    root: Path,
-    save_name: str,
+    save_directory: Path,
     requested_platoons: list[str],
     verbose: bool,
 ) -> None:
-    snapshot = load_snapshot(resolve_save_directory(root, save_name))
+    snapshot = load_snapshot(save_directory)
     characters = (
         characters_in_platoons(snapshot, requested_platoons)
         if requested_platoons
@@ -777,8 +728,8 @@ def command_list(
         print(row)
 
 
-def command_relations(root: Path, save_name: str) -> None:
-    snapshot = load_snapshot(resolve_save_directory(root, save_name))
+def command_relations(save_directory: Path) -> None:
+    snapshot = load_snapshot(save_directory)
     relations = sorted(
         faction_relations(snapshot),
         key=lambda relation: (
@@ -1024,7 +975,11 @@ def plan_healing_changes(
 
     def add_change(ref: ValueRef, kind: str, label: str, new_value: int | float) -> None:
         old_value = int(ref.value) if kind == "bool" else float(ref.value)
-        if old_value == new_value:
+        if (
+            old_value == new_value
+            if kind == "bool"
+            else abs(float(old_value) - float(new_value)) < 0.0001
+        ):
             return
         if ref.offset is None:
             raise SaveEditError(f"{context}: {label} has no numeric offset")
@@ -1159,26 +1114,6 @@ def build_modified_files(
     return modified
 
 
-def create_backup(
-    save_directory: Path,
-    modified: dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]],
-) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    backup = (
-        Path.home()
-        / ".local/share/kenshi-save-edit/backups"
-        / save_directory.name
-        / timestamp
-    )
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(save_directory, backup)
-    for path, (original, _, _) in modified.items():
-        backup_path = backup / path.relative_to(save_directory)
-        if backup_path.read_bytes() != original:
-            raise SaveEditError(f"backup verification failed: {backup_path}")
-    return backup
-
-
 def prepare_temp_file(path: Path, data: bytes) -> Path:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.kenshi-save-edit-",
@@ -1197,26 +1132,7 @@ def prepare_temp_file(path: Path, data: bytes) -> Path:
         raise
 
 
-def fsync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def atomic_write(path: Path, data: bytes) -> None:
-    temporary = prepare_temp_file(path, data)
-    try:
-        os.replace(temporary, path)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def commit_changes(
-    save_directory: Path,
-    backup: Path,
     modified: dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]],
 ) -> None:
     for path, (original, _, _) in modified.items():
@@ -1230,29 +1146,12 @@ def commit_changes(
 
         for path, temporary in temporary_files.items():
             os.replace(temporary, path)
-            fsync_directory(path.parent)
 
         for path, (_, expected, _) in modified.items():
             actual = path.read_bytes()
             if actual != expected:
                 raise SaveEditError(f"{path}: post-write verification failed")
             parse_data_file(path, actual)
-    except Exception as error:
-        restore_errors: list[str] = []
-        for path in modified:
-            backup_path = backup / path.relative_to(save_directory)
-            try:
-                atomic_write(path, backup_path.read_bytes())
-            except Exception as restore_error:
-                restore_errors.append(f"{path}: {restore_error}")
-        if restore_errors:
-            detail = "; ".join(restore_errors)
-            raise SaveEditError(
-                f"write failed ({error}); backup restore also failed: {detail}"
-            ) from error
-        raise SaveEditError(
-            f"write failed and original files were restored from {backup}: {error}"
-        ) from error
     finally:
         for temporary in temporary_files.values():
             temporary.unlink(missing_ok=True)
@@ -1283,17 +1182,6 @@ def build_stat_request(
     )
     stats.update(validate_unique_stats(assignments))
     return stats, "exact" if has_exact else "minimum"
-
-
-def next_automatic_save_name(root: Path, source_name: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    base = f"{source_name}_edited_{timestamp}"
-    candidate = base
-    suffix = 2
-    while (root / candidate).exists():
-        candidate = f"{base}-{suffix}"
-        suffix += 1
-    return candidate
 
 
 def print_planned_changes(changes: tuple[PlannedChange, ...]) -> None:
@@ -1430,11 +1318,8 @@ def verify_final_state(
 
 
 def command_set(
-    root: Path,
-    save_name: str,
-    copy_as: str | None,
-    in_place: bool,
-    allow_running_in_place: bool,
+    input_save: Path,
+    output_save: Path,
     dry_run: bool,
     requested_names: list[str],
     requested_ids: list[str],
@@ -1448,20 +1333,6 @@ def command_set(
     feed: bool,
     relation_assignments: list[tuple[str, float]],
 ) -> None:
-    running = find_running_kenshi_processes()
-    if copy_as is not None and in_place:
-        raise SaveEditError("--copy-as and --in-place cannot be used together")
-    if allow_running_in_place and not in_place:
-        raise SaveEditError(
-            "--allow-running-in-place requires --in-place"
-        )
-    if running and in_place and not allow_running_in_place:
-        details = "\n".join(f"  PID {pid}: {command}" for pid, command in running)
-        raise SaveEditError(
-            "Kenshi or FCS is running; omit --in-place to create a safe copy, "
-            "or explicitly use --allow-running-in-place:\n"
-            + details
-        )
     if money is not None and not 0 <= money <= MAX_MONEY:
         raise SaveEditError(f"money must be between 0 and {MAX_MONEY}")
 
@@ -1477,8 +1348,7 @@ def command_set(
             "and/or --relation"
         )
 
-    source_directory = resolve_save_directory(root, save_name)
-    source_snapshot = load_snapshot(source_directory)
+    source_snapshot = load_snapshot(input_save)
     if stats or heal or feed:
         targets = select_targets(
             source_snapshot,
@@ -1525,83 +1395,82 @@ def command_set(
         relation_assignments,
     )
     if not source_changes:
-        print("No changes needed; no backup was created.")
+        print("No changes needed; no output save was created.")
         return
 
-    output_name = (
-        source_directory.name
-        if in_place
-        else copy_as or next_automatic_save_name(root, source_directory.name)
-    )
-    if not in_place:
-        resolve_new_save_directory(root, output_name)
-
     print_planned_changes(source_changes)
-    print(
-        f"Output: {output_name}"
-        + (" (in place)" if in_place else " (new save)")
-    )
+    print(f"Input: {input_save}")
+    print(f"Output: {output_save}")
     build_modified_files(source_snapshot, source_changes)
     if dry_run:
         print("Dry run complete; no files were copied or changed.")
         return
 
-    created_copy = not in_place
-    if created_copy:
-        save_directory = root / output_name
-        copy_stable_save(source_directory, save_directory)
-        print(f"Copy: {source_directory.name} -> {save_directory.name}")
-    else:
-        save_directory = source_directory
-
-    snapshot = load_snapshot(save_directory)
-    characters = (
-        select_targets(
+    copy_stable_save(input_save, output_save)
+    print(f"Copy: {input_save} -> {output_save}")
+    try:
+        snapshot = load_snapshot(output_save)
+        characters = (
+            select_targets(
+                snapshot,
+                requested_names,
+                requested_ids,
+                requested_platoons,
+            )
+            if stats or heal or feed
+            else ()
+        )
+        changes = plan_changes(
             snapshot,
+            characters,
+            money,
+            stats,
+            stat_mode,
+            heal,
+            feed,
+            relation_assignments,
+        )
+        if not changes:
+            shutil.rmtree(output_save)
+            print("No changes needed; no output save was kept.")
+            return
+
+        modified = build_modified_files(snapshot, changes)
+        commit_changes(modified)
+
+        final_snapshot = load_snapshot(output_save)
+        verify_final_state(
+            final_snapshot,
             requested_names,
             requested_ids,
             requested_platoons,
+            money,
+            stats,
+            stat_mode,
+            heal,
+            feed,
+            relation_assignments,
         )
-        if stats or heal or feed
-        else ()
-    )
-    changes = plan_changes(
-        snapshot,
-        characters,
-        money,
-        stats,
-        stat_mode,
-        heal,
-        feed,
-        relation_assignments,
-    )
-    if not changes:
-        if created_copy:
-            shutil.rmtree(save_directory)
-        print("No changes needed; no save copy or backup was kept.")
-        return
+    except Exception as error:
+        try:
+            if output_save.exists():
+                shutil.rmtree(output_save)
+        except Exception as cleanup_error:
+            raise SaveEditError(
+                f"editing failed ({error}); incomplete output could not be removed: "
+                f"{cleanup_error}"
+            ) from error
+        raise
 
-    modified = build_modified_files(snapshot, changes)
-    backup = create_backup(save_directory, modified)
-    commit_changes(save_directory, backup, modified)
+    print(f"Save: {output_save}")
+    print("Changes applied and verified; input save was not modified.")
 
-    final_snapshot = load_snapshot(save_directory)
-    verify_final_state(
-        final_snapshot,
-        requested_names,
-        requested_ids,
-        requested_platoons,
-        money,
-        stats,
-        stat_mode,
-        heal,
-        feed,
-        relation_assignments,
-    )
 
-    print(f"Save: {save_directory}")
-    print(f"Backup: {backup}")
-    print("Changes applied and verified.")
+def installed_version() -> str:
+    try:
+        return version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return PACKAGE_VERSION
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1613,15 +1482,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--save-root",
-        help="override the automatically discovered Kenshi save directory",
+        "--version",
+        action="version",
+        version=f"%(prog)s {installed_version()}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser(
         "list", help="show money and player character stats"
     )
-    list_parser.add_argument("--save", required=True, help="save directory name")
+    list_parser.add_argument(
+        "input_save",
+        metavar="INPUT_SAVE",
+        help="path to the existing save directory",
+    )
     list_parser.add_argument(
         "--platoon",
         action="append",
@@ -1637,30 +1511,24 @@ def build_parser() -> argparse.ArgumentParser:
     relations_parser = subparsers.add_parser(
         "relations", help="show player relations with every faction"
     )
-    relations_parser.add_argument("--save", required=True, help="save directory name")
+    relations_parser.add_argument(
+        "input_save",
+        metavar="INPUT_SAVE",
+        help="path to the existing save directory",
+    )
 
     set_parser = subparsers.add_parser(
-        "set", help="back up a save and immediately apply changes"
-    )
-    set_parser.add_argument("--save", required=True, help="save directory name")
-    set_parser.add_argument(
-        "--copy-as",
-        help=(
-            "use this name for the edited copy instead of an automatic name"
-        ),
+        "set", help="create and edit a new copy of a save"
     )
     set_parser.add_argument(
-        "--in-place",
-        action="store_true",
-        help="edit --save itself instead of creating a new save",
+        "input_save",
+        metavar="INPUT_SAVE",
+        help="path to the existing save directory",
     )
     set_parser.add_argument(
-        "--allow-running-in-place",
-        action="store_true",
-        help=(
-            "edit --save in place while Kenshi is running; use only when the "
-            "save is not being written and reload it afterwards"
-        ),
+        "output_save",
+        metavar="OUTPUT_SAVE",
+        help="path for the new edited save directory",
     )
     set_parser.add_argument(
         "--dry-run",
@@ -1740,27 +1608,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
     try:
-        root = discover_save_root(arguments.save_root)
+        input_save = resolve_input_save(arguments.input_save)
         if arguments.command == "list":
             command_list(
-                root,
-                arguments.save,
+                input_save,
                 arguments.platoon,
                 arguments.verbose,
             )
         elif arguments.command == "relations":
-            command_relations(root, arguments.save)
+            command_relations(input_save)
         else:
+            output_save = resolve_output_save(
+                arguments.output_save,
+                input_save,
+            )
             command_set(
-                root,
-                arguments.save,
-                arguments.copy_as,
-                arguments.in_place,
-                arguments.allow_running_in_place,
+                input_save,
+                output_save,
                 arguments.dry_run,
                 arguments.character,
                 arguments.character_id,
