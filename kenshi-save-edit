@@ -1,0 +1,1784 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import struct
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+
+DATA_FILE_TYPE = 15
+STATS_TYPE = 25
+INSTANCE_COLLECTION_TYPE = 30
+FACTION_TYPE = 37
+MEDICAL_STATE_TYPE = 57
+CAMERA_TYPE = 56
+CHARACTER_APPEARANCE_TYPE = 66
+MAX_MONEY = 2_000_000_000
+MAX_STAT = 100.0
+MIN_RELATION = -100.0
+MAX_RELATION = 100.0
+
+BODY_HEALTH_RATIOS = {
+    "3985-gamedata.base": (1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5),
+    "3992-gamedata.base": (1.5, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0),
+    "3998-gamedata.base": (2.5, 2.5, 2.5, 1.0, 1.0, 2.5, 2.5),
+}
+
+OFFICIAL_STATS = (
+    "dexterity",
+    "strength",
+    "toughness2",
+    "perception",
+    "attack",
+    "defence",
+    "dodge",
+    "unarmed",
+    "athletics",
+    "swimming",
+    "engineer",
+    "medic",
+    "robotics",
+    "science",
+    "assassin",
+    "lockpicking",
+    "stealth",
+    "thievery",
+    "armour smith",
+    "bow smith",
+    "cooking",
+    "farming",
+    "labouring",
+    "weapon smith",
+    "blunt",
+    "bow",
+    "ff",
+    "hackers",
+    "heavy weapons",
+    "katana",
+    "poles",
+    "sabres",
+    "turrets",
+)
+
+SAVE_ROOT_CANDIDATES = (
+    Path.home()
+    / ".steam/steam/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
+    Path.home()
+    / ".steam/debian-installation/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
+    Path.home()
+    / ".local/share/Steam/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save",
+)
+
+STAT_ALIASES = {
+    "strength": "strength",
+    "dexterity": "dexterity",
+    "toughness": "toughness2",
+    "toughness2": "toughness2",
+    "athletics": "athletics",
+    "attack": "attack",
+    "defence": "defence",
+    "defense": "defence",
+    "dodge": "dodge",
+    "martial arts": "unarmed",
+    "unarmed": "unarmed",
+    "crossbows": "bow",
+    "bow": "bow",
+    "polearms": "poles",
+    "poles": "poles",
+    "precision shooting": "ff",
+    "ff": "ff",
+    "assassination": "assassin",
+    "assassin": "assassin",
+    "perception": "perception",
+    "turrets": "turrets",
+    "stealth": "stealth",
+    "thievery": "thievery",
+    "lockpicking": "lockpicking",
+    "medic": "medic",
+    "robotics": "robotics",
+    "science": "science",
+    "engineering": "engineer",
+    "engineer": "engineer",
+    "weapon smith": "weapon smith",
+    "bow smith": "bow smith",
+    "armour smith": "armour smith",
+    "armor smith": "armour smith",
+    "labouring": "labouring",
+    "farming": "farming",
+    "cooking": "cooking",
+    "swimming": "swimming",
+    "heavy weapons": "heavy weapons",
+    "hackers": "hackers",
+    "katana": "katana",
+    "sabres": "sabres",
+    "blunt": "blunt",
+}
+
+DISPLAY_STATS = (
+    ("STR", "strength"),
+    ("DEX", "dexterity"),
+    ("TOU", "toughness2"),
+    ("ATK", "attack"),
+    ("DEF", "defence"),
+    ("DOD", "dodge"),
+    ("ATH", "athletics"),
+)
+
+
+class SaveEditError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ValueRef:
+    kind: str
+    offset: int | None
+    value: object
+
+
+@dataclass(frozen=True)
+class Reference:
+    target_id: str
+    values: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class Instance:
+    target_id: str
+    states: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Record:
+    record_id: int
+    type_code: int
+    name: str
+    string_id: str
+    values: dict[str, ValueRef]
+    references: dict[str, tuple[Reference, ...]]
+    instances: tuple[Instance, ...]
+
+
+@dataclass(frozen=True)
+class ParsedFile:
+    path: Path
+    data: bytes
+    records: tuple[Record, ...]
+    records_end: int
+
+
+@dataclass(frozen=True)
+class CharacterStats:
+    platoon: ParsedFile
+    record: Record
+    medical: Record
+    appearance: Record
+
+
+@dataclass(frozen=True)
+class FactionRelation:
+    record: Record
+    game_id: str
+    relation: ValueRef
+
+
+@dataclass(frozen=True)
+class SaveSnapshot:
+    directory: Path
+    quick_save: ParsedFile
+    camera: Record
+    faction: str
+    characters: tuple[CharacterStats, ...]
+
+
+@dataclass(frozen=True)
+class PlannedChange:
+    path: Path
+    offset: int
+    kind: str
+    label: str
+    old_value: int | float
+    new_value: int | float
+
+
+class BinaryReader:
+    def __init__(self, data: bytes, source: Path):
+        self.data = data
+        self.source = source
+        self.position = 0
+
+    def _take(self, size: int) -> tuple[int, bytes]:
+        if size < 0:
+            raise SaveEditError(
+                f"{self.source}: negative field size at offset {self.position}"
+            )
+        end = self.position + size
+        if end > len(self.data):
+            raise SaveEditError(
+                f"{self.source}: truncated data at offset {self.position}"
+            )
+        start = self.position
+        self.position = end
+        return start, self.data[start:end]
+
+    def _unpack(self, fmt: str, size: int) -> tuple[int, int | float]:
+        offset, raw = self._take(size)
+        return offset, struct.unpack(fmt, raw)[0]
+
+    def read_u8(self) -> tuple[int, int]:
+        offset, raw = self._take(1)
+        return offset, raw[0]
+
+    def read_i32(self) -> tuple[int, int]:
+        offset, value = self._unpack("<i", 4)
+        return offset, int(value)
+
+    def read_u32(self) -> tuple[int, int]:
+        offset, value = self._unpack("<I", 4)
+        return offset, int(value)
+
+    def read_f32(self) -> tuple[int, float]:
+        offset, value = self._unpack("<f", 4)
+        return offset, float(value)
+
+    def read_count(self, label: str) -> int:
+        _, count = self.read_i32()
+        if count < 0:
+            raise SaveEditError(
+                f"{self.source}: negative {label} at offset {self.position - 4}"
+            )
+        return count
+
+    def read_raw_string(self) -> tuple[int, bytes]:
+        length = self.read_count("string length")
+        return self._take(length)
+
+    def read_text(self, label: str) -> str:
+        offset, raw = self.read_raw_string()
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise SaveEditError(
+                f"{self.source}: invalid UTF-8 in {label} at offset {offset}"
+            ) from error
+
+    def skip_string(self) -> None:
+        self.read_raw_string()
+
+    def skip(self, size: int) -> None:
+        self._take(size)
+
+    def read_record(self) -> Record:
+        self.read_i32()
+        _, type_code = self.read_i32()
+        _, record_id = self.read_i32()
+        name = self.read_text("record name")
+        string_id = self.read_text("record string ID")
+        self.read_u32()
+        values: dict[str, ValueRef] = {}
+
+        scalar_readers: tuple[
+            tuple[str, Callable[[], tuple[int, int | float]]], ...
+        ] = (
+            ("bool", self.read_u8),
+            ("float", self.read_f32),
+            ("int", self.read_i32),
+        )
+        for kind, reader in scalar_readers:
+            for _ in range(self.read_count(f"{kind} value count")):
+                key = self.read_text(f"{kind} key")
+                offset, value = reader()
+                values[key] = ValueRef(kind, offset, value)
+
+        for size, kind in ((12, "vector3"), (16, "vector4")):
+            for _ in range(self.read_count(f"{kind} value count")):
+                key = self.read_text(f"{kind} key")
+                offset, raw = self._take(size)
+                values[key] = ValueRef(kind, offset, raw)
+
+        for kind in ("string", "file"):
+            for _ in range(self.read_count(f"{kind} value count")):
+                key = self.read_text(f"{kind} key")
+                value = self.read_text(f"{kind} value")
+                values[key] = ValueRef(kind, None, value)
+
+        references: dict[str, tuple[Reference, ...]] = {}
+        for _ in range(self.read_count("reference category count")):
+            category = self.read_text("reference category")
+            entries: list[Reference] = []
+            for _ in range(self.read_count("reference count")):
+                target_id = self.read_text("reference target ID")
+                _, raw = self._take(12)
+                entries.append(Reference(target_id, struct.unpack("<iii", raw)))
+            references[category] = tuple(entries)
+
+        instances: list[Instance] = []
+        for _ in range(self.read_count("instance count")):
+            self.skip_string()
+            target_id = self.read_text("instance target ID")
+            self.skip(28)
+            states = tuple(
+                self.read_text("instance state ID")
+                for _ in range(self.read_count("instance state count"))
+            )
+            instances.append(Instance(target_id, states))
+
+        return Record(
+            record_id,
+            type_code,
+            name,
+            string_id,
+            values,
+            references,
+            tuple(instances),
+        )
+
+
+def parse_data_file(path: Path, data: bytes | None = None) -> ParsedFile:
+    file_data = path.read_bytes() if data is None else data
+    reader = BinaryReader(file_data, path)
+    _, file_type = reader.read_i32()
+    if file_type != DATA_FILE_TYPE:
+        raise SaveEditError(
+            f"{path}: unsupported file type {file_type}, expected {DATA_FILE_TYPE}"
+        )
+    reader.read_i32()
+    record_count = reader.read_count("record count")
+    records = tuple(reader.read_record() for _ in range(record_count))
+    return ParsedFile(path, file_data, records, reader.position)
+
+
+def normalize_stat_name(name: str) -> str:
+    return " ".join(name.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def parse_stat_assignment(value: str) -> tuple[str, float]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("stat must use NAME=VALUE")
+    name, raw_value = value.split("=", 1)
+    normalized = normalize_stat_name(name)
+    key = STAT_ALIASES.get(normalized)
+    if key is None:
+        supported = ", ".join(sorted(STAT_ALIASES))
+        raise argparse.ArgumentTypeError(
+            f"unknown stat {name!r}; supported names: {supported}"
+        )
+    try:
+        stat_value = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid value for stat {name!r}: {raw_value!r}"
+        ) from error
+    if not 0 <= stat_value <= MAX_STAT:
+        raise argparse.ArgumentTypeError(
+            f"stat {name!r} must be between 0 and {MAX_STAT:g}"
+        )
+    return key, stat_value
+
+
+def parse_stat_minimum(value: str) -> float:
+    try:
+        minimum = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid stat minimum: {value!r}") from error
+    if not 0 <= minimum <= MAX_STAT:
+        raise argparse.ArgumentTypeError(
+            f"stat minimum must be between 0 and {MAX_STAT:g}"
+        )
+    return minimum
+
+
+def parse_relation_assignment(value: str) -> tuple[str, float]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("relation must use FACTION=VALUE")
+    faction, raw_value = value.rsplit("=", 1)
+    faction = faction.strip()
+    if not faction:
+        raise argparse.ArgumentTypeError("faction name or ID cannot be empty")
+    try:
+        relation = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid relation value: {raw_value!r}"
+        ) from error
+    if not MIN_RELATION <= relation <= MAX_RELATION:
+        raise argparse.ArgumentTypeError(
+            f"relation must be between {MIN_RELATION:g} and {MAX_RELATION:g}"
+        )
+    return faction, relation
+
+
+def discover_save_root(explicit: str | None) -> Path:
+    if explicit:
+        root = Path(explicit).expanduser().resolve()
+        if not root.is_dir():
+            raise SaveEditError(f"save root does not exist: {root}")
+        return root
+
+    for candidate in SAVE_ROOT_CANDIDATES:
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    searched = "\n  ".join(str(path) for path in SAVE_ROOT_CANDIDATES)
+    raise SaveEditError(f"Kenshi save root not found; searched:\n  {searched}")
+
+
+def validate_save_name(save_name: str) -> None:
+    if not save_name or save_name in {".", ".."}:
+        raise SaveEditError("invalid save name")
+    if Path(save_name).name != save_name:
+        raise SaveEditError("save must be a directory name, not a path")
+
+
+def resolve_save_directory(root: Path, save_name: str) -> Path:
+    validate_save_name(save_name)
+    directory = root / save_name
+    if not directory.is_dir():
+        raise SaveEditError(f"save does not exist: {directory}")
+    return directory
+
+
+def resolve_new_save_directory(root: Path, save_name: str) -> Path:
+    validate_save_name(save_name)
+    directory = root / save_name
+    if directory.exists():
+        raise SaveEditError(f"refusing to overwrite existing save: {directory}")
+    return directory
+
+
+def tree_signature(directory: Path) -> dict[Path, tuple[int, int]]:
+    signature: dict[Path, tuple[int, int]] = {}
+    for path in directory.rglob("*"):
+        if path.is_file():
+            stat = path.stat()
+            signature[path.relative_to(directory)] = (stat.st_size, stat.st_mtime_ns)
+    return signature
+
+
+def copy_stable_save(source: Path, destination: Path) -> None:
+    before = tree_signature(source)
+    try:
+        shutil.copytree(source, destination)
+        after = tree_signature(source)
+        if before != after:
+            raise SaveEditError(
+                f"source save changed while copying; discarded {destination}"
+            )
+
+        copied = tree_signature(destination)
+        if set(copied) != set(after):
+            raise SaveEditError(f"incomplete save copy; discarded {destination}")
+        for relative_path in after:
+            source_path = source / relative_path
+            destination_path = destination / relative_path
+            if source_path.read_bytes() != destination_path.read_bytes():
+                raise SaveEditError(
+                    f"copy verification failed for {relative_path}; "
+                    f"discarded {destination}"
+                )
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+
+
+def require_value(record: Record, key: str, kind: str, context: str) -> ValueRef:
+    value = record.values.get(key)
+    if value is None:
+        raise SaveEditError(f"{context}: missing field {key!r}")
+    if value.kind != kind:
+        raise SaveEditError(
+            f"{context}: field {key!r} has type {value.kind}, expected {kind}"
+        )
+    if kind in {"int", "float"} and value.offset is None:
+        raise SaveEditError(f"{context}: field {key!r} has no numeric offset")
+    return value
+
+
+def load_snapshot(save_directory: Path) -> SaveSnapshot:
+    quick_path = save_directory / "quick.save"
+    if not quick_path.is_file():
+        raise SaveEditError(f"missing quick.save: {quick_path}")
+    quick_save = parse_data_file(quick_path)
+    cameras = [
+        record
+        for record in quick_save.records
+        if record.type_code == CAMERA_TYPE and "player money" in record.values
+    ]
+    if len(cameras) != 1:
+        raise SaveEditError(
+            f"{quick_path}: expected one CAMERA/player money record, found {len(cameras)}"
+        )
+    camera = cameras[0]
+    require_value(camera, "player money", "int", str(quick_path))
+    faction_ref = require_value(camera, "pfaction name", "string", str(quick_path))
+    faction = str(faction_ref.value)
+    if not faction:
+        raise SaveEditError(f"{quick_path}: player faction name is empty")
+
+    platoon_directory = save_directory / "platoon"
+    if not platoon_directory.is_dir():
+        raise SaveEditError(f"missing platoon directory: {platoon_directory}")
+    prefix = f"{faction}_"
+    platoon_paths = sorted(
+        (
+            path
+            for path in platoon_directory.glob("*.platoon")
+            if path.name.startswith(prefix)
+        ),
+        key=lambda path: path.name,
+    )
+    if not platoon_paths:
+        raise SaveEditError(
+            f"{platoon_directory}: no player platoons for faction {faction!r}"
+        )
+
+    characters: list[CharacterStats] = []
+    for path in platoon_paths:
+        platoon = parse_data_file(path)
+        records_by_string_id = {
+            record.string_id: record for record in platoon.records
+        }
+        linked_stats: set[str] = set()
+        for collection in platoon.records:
+            if collection.type_code != INSTANCE_COLLECTION_TYPE:
+                continue
+            for instance in collection.instances:
+                states = [
+                    records_by_string_id[state]
+                    for state in instance.states
+                    if state in records_by_string_id
+                ]
+                stats = [record for record in states if record.type_code == STATS_TYPE]
+                medical = [
+                    record
+                    for record in states
+                    if record.type_code == MEDICAL_STATE_TYPE
+                ]
+                appearance = [
+                    record
+                    for record in states
+                    if record.type_code == CHARACTER_APPEARANCE_TYPE
+                ]
+                if len(stats) != 1 or len(medical) != 1 or len(appearance) != 1:
+                    continue
+                characters.append(
+                    CharacterStats(platoon, stats[0], medical[0], appearance[0])
+                )
+                linked_stats.add(stats[0].string_id)
+
+        unlinked = [
+            record
+            for record in platoon.records
+            if record.type_code == STATS_TYPE and record.string_id not in linked_stats
+        ]
+        if unlinked:
+            raise SaveEditError(
+                f"{path}: found {len(unlinked)} STATS records without a unique "
+                "MEDICAL_STATE/CHARACTER_APPEARANCE link"
+            )
+
+    if not characters:
+        raise SaveEditError(f"{platoon_directory}: no player STATS records found")
+    return SaveSnapshot(
+        save_directory,
+        quick_save,
+        camera,
+        faction,
+        tuple(characters),
+    )
+
+
+def faction_relations(snapshot: SaveSnapshot) -> tuple[FactionRelation, ...]:
+    factions = [
+        record
+        for record in snapshot.quick_save.records
+        if record.type_code == FACTION_TYPE
+    ]
+    player_factions = [
+        record for record in factions if record.name == snapshot.faction
+    ]
+    if len(player_factions) != 1:
+        raise SaveEditError(
+            f"{snapshot.quick_save.path}: expected one player faction record "
+            f"named {snapshot.faction!r}, found {len(player_factions)}"
+        )
+    player_id = str(
+        require_value(
+            player_factions[0],
+            "gamedata stringID",
+            "string",
+            f"{snapshot.quick_save.path}:{snapshot.faction}",
+        ).value
+    )
+
+    relations: list[FactionRelation] = []
+    for record in factions:
+        if record is player_factions[0]:
+            continue
+        context = f"{snapshot.quick_save.path}:{record.name}"
+        game_id = str(
+            require_value(record, "gamedata stringID", "string", context).value
+        )
+        relation_sids = [
+            key
+            for key, ref in record.values.items()
+            if key.startswith("relationSID")
+            and ref.kind == "string"
+            and ref.value == player_id
+        ]
+        if len(relation_sids) != 1:
+            raise SaveEditError(
+                f"{context}: expected one relation to player faction {player_id!r}, "
+                f"found {len(relation_sids)}"
+            )
+        suffix = relation_sids[0].removeprefix("relationSID")
+        relation = require_value(record, f"relation{suffix}", "float", context)
+        relations.append(FactionRelation(record, game_id, relation))
+    return tuple(relations)
+
+
+def select_faction_relations(
+    snapshot: SaveSnapshot,
+    assignments: list[tuple[str, float]],
+) -> tuple[tuple[FactionRelation, float], ...]:
+    available = faction_relations(snapshot)
+    selected: list[tuple[FactionRelation, float]] = []
+    seen: set[str] = set()
+    for requested, value in assignments:
+        matches = [
+            relation
+            for relation in available
+            if relation.game_id == requested
+            or relation.record.name.casefold() == requested.casefold()
+        ]
+        if len(matches) != 1:
+            details = "; ".join(
+                f"{relation.record.name} [{relation.game_id}]"
+                for relation in sorted(
+                    matches,
+                    key=lambda candidate: (
+                        candidate.record.name.casefold(),
+                        candidate.game_id,
+                    ),
+                )
+            )
+            if not details:
+                details = "run the relations command to list available factions"
+            raise SaveEditError(
+                f"faction {requested!r}: expected one match, found {len(matches)}; "
+                f"{details}"
+            )
+        relation = matches[0]
+        if relation.record.string_id in seen:
+            raise SaveEditError(
+                f"faction selected more than once: {relation.record.name} "
+                f"[{relation.game_id}]"
+            )
+        seen.add(relation.record.string_id)
+        selected.append((relation, value))
+    return tuple(selected)
+
+
+def find_running_kenshi_processes() -> list[tuple[int, str]]:
+    markers = ("kenshi_x64.exe", "forgotten construction set.exe")
+    matches: list[tuple[int, str]] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return matches
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        command = raw.replace(b"\0", b" ").decode("utf-8", errors="ignore").strip()
+        lowered = command.lower()
+        if command and any(marker in lowered for marker in markers):
+            matches.append((pid, command))
+    return matches
+
+
+def character_identity(character: CharacterStats) -> tuple[Path, str]:
+    return character.platoon.path, character.record.string_id
+
+
+def character_description(character: CharacterStats) -> str:
+    return (
+        f"{character.record.name} @ {character.platoon.path.stem} "
+        f"[{character.record.string_id}]"
+    )
+
+
+def characters_in_platoons(
+    snapshot: SaveSnapshot, requested_platoons: list[str]
+) -> tuple[CharacterStats, ...]:
+    available = sorted({character.platoon.path.stem for character in snapshot.characters})
+    selected: list[CharacterStats] = []
+    for requested in requested_platoons:
+        stem = requested.removesuffix(".platoon")
+        matches = [
+            character
+            for character in snapshot.characters
+            if character.platoon.path.stem.casefold() == stem.casefold()
+        ]
+        if not matches:
+            raise SaveEditError(
+                f"platoon {requested!r} was not found; available: "
+                + ", ".join(available)
+            )
+        selected.extend(matches)
+    return unique_characters(selected)
+
+
+def command_list(
+    root: Path,
+    save_name: str,
+    requested_platoons: list[str],
+    verbose: bool,
+) -> None:
+    snapshot = load_snapshot(resolve_save_directory(root, save_name))
+    characters = (
+        characters_in_platoons(snapshot, requested_platoons)
+        if requested_platoons
+        else snapshot.characters
+    )
+    money = require_value(
+        snapshot.camera, "player money", "int", str(snapshot.quick_save.path)
+    )
+    print(f"Save: {snapshot.directory}")
+    print(f"Faction: {snapshot.faction}")
+    print(f"Money: {int(money.value)}")
+    print(f"Characters: {len(characters)}")
+    header = f"{'Name':<18} {'Platoon':<26}"
+    header += "".join(f" {label:>6}" for label, _ in DISPLAY_STATS)
+    if verbose:
+        header += "  ID"
+    print(header)
+    for character in characters:
+        row = f"{character.record.name:<18} {character.platoon.path.name:<26}"
+        for _, key in DISPLAY_STATS:
+            ref = character.record.values.get(key)
+            row += f" {float(ref.value):6.1f}" if ref else "      -"
+        if verbose:
+            row += f"  {character.record.string_id}"
+        print(row)
+
+
+def command_relations(root: Path, save_name: str) -> None:
+    snapshot = load_snapshot(resolve_save_directory(root, save_name))
+    relations = sorted(
+        faction_relations(snapshot),
+        key=lambda relation: (
+            relation.record.name.casefold(),
+            relation.game_id,
+        ),
+    )
+    print(f"Save: {snapshot.directory}")
+    print(f"Player faction: {snapshot.faction}")
+    print(f"Factions: {len(relations)}")
+    print(f"{'Relation':>9}  {'Faction':<36}  ID")
+    for relation in relations:
+        print(
+            f"{float(relation.relation.value):9.2f}  "
+            f"{relation.record.name:<36}  {relation.game_id}"
+        )
+
+
+def validate_unique_stats(stats: list[tuple[str, float]]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for key, value in stats:
+        if key in result:
+            raise SaveEditError(f"stat specified more than once: {key}")
+        result[key] = value
+    return result
+
+
+def select_characters_by_name(
+    snapshot: SaveSnapshot, requested_names: list[str]
+) -> tuple[CharacterStats, ...]:
+    selected: list[CharacterStats] = []
+    for requested in requested_names:
+        matches = [
+            character
+            for character in snapshot.characters
+            if character.record.name.casefold() == requested.casefold()
+        ]
+        if len(matches) != 1:
+            details = "; ".join(
+                character_description(character)
+                for character in sorted(
+                    matches or snapshot.characters,
+                    key=lambda candidate: (
+                        candidate.record.name.casefold(),
+                        candidate.platoon.path.name,
+                        candidate.record.string_id,
+                    ),
+                )
+            )
+            raise SaveEditError(
+                f"character {requested!r}: expected one match, found {len(matches)}; "
+                f"use --character-id for duplicates; candidates: {details}"
+            )
+        selected.append(matches[0])
+    return unique_characters(selected)
+
+
+def select_characters_by_id(
+    snapshot: SaveSnapshot, requested_ids: list[str]
+) -> tuple[CharacterStats, ...]:
+    selected: list[CharacterStats] = []
+    for requested in requested_ids:
+        matches = [
+            character
+            for character in snapshot.characters
+            if character.record.string_id == requested
+            or str(character.record.record_id) == requested
+        ]
+        if len(matches) != 1:
+            raise SaveEditError(
+                f"character ID {requested!r}: expected one match, found {len(matches)}"
+            )
+        selected.append(matches[0])
+    return unique_characters(selected)
+
+
+def unique_characters(
+    characters: list[CharacterStats],
+) -> tuple[CharacterStats, ...]:
+    unique: list[CharacterStats] = []
+    seen: set[tuple[Path, str]] = set()
+    for character in characters:
+        identity = character_identity(character)
+        if identity in seen:
+            raise SaveEditError(
+                f"character selected more than once: {character_description(character)}"
+            )
+        seen.add(identity)
+        unique.append(character)
+    return tuple(unique)
+
+
+def select_targets(
+    snapshot: SaveSnapshot,
+    requested_names: list[str],
+    requested_ids: list[str],
+    requested_platoons: list[str],
+) -> tuple[CharacterStats, ...]:
+    modes = sum(
+        bool(requested)
+        for requested in (requested_names, requested_ids, requested_platoons)
+    )
+    if modes > 1:
+        raise SaveEditError(
+            "--character, --character-id, and --platoon are mutually exclusive"
+        )
+    if requested_names:
+        return select_characters_by_name(snapshot, requested_names)
+    if requested_ids:
+        return select_characters_by_id(snapshot, requested_ids)
+    if requested_platoons:
+        return characters_in_platoons(snapshot, requested_platoons)
+    return ()
+
+
+def plan_changes(
+    snapshot: SaveSnapshot,
+    characters: tuple[CharacterStats, ...],
+    money: int | None,
+    stats: dict[str, float],
+    stat_mode: str | None,
+    heal: bool,
+    feed: bool,
+    relation_assignments: list[tuple[str, float]],
+) -> tuple[PlannedChange, ...]:
+    changes: list[PlannedChange] = []
+    if money is not None:
+        money_ref = require_value(
+            snapshot.camera, "player money", "int", str(snapshot.quick_save.path)
+        )
+        old_money = int(money_ref.value)
+        if old_money != money:
+            changes.append(
+                PlannedChange(
+                    snapshot.quick_save.path,
+                    int(money_ref.offset),
+                    "int",
+                    "player money",
+                    old_money,
+                    money,
+                )
+            )
+
+    for relation, requested_value in select_faction_relations(
+        snapshot, relation_assignments
+    ):
+        old_value = float(relation.relation.value)
+        if old_value != requested_value:
+            changes.append(
+                PlannedChange(
+                    snapshot.quick_save.path,
+                    int(relation.relation.offset),
+                    "float",
+                    f"{relation.record.name} relation",
+                    old_value,
+                    requested_value,
+                )
+            )
+
+    for character in characters:
+        for key, requested_value in stats.items():
+            ref = require_value(
+                character.record,
+                key,
+                "float",
+                f"{character.platoon.path}:{character.record.name}",
+            )
+            old_value = float(ref.value)
+            new_value = (
+                max(old_value, requested_value)
+                if stat_mode == "minimum"
+                else requested_value
+            )
+            if new_value != old_value:
+                changes.append(
+                    PlannedChange(
+                        character.platoon.path,
+                        int(ref.offset),
+                        "float",
+                        f"{character.record.name}.{key}",
+                        old_value,
+                        new_value,
+                    )
+                )
+        if heal:
+            changes.extend(plan_healing_changes(character))
+        if feed:
+            changes.extend(plan_feeding_changes(character))
+    return tuple(changes)
+
+
+def character_race_id(character: CharacterStats) -> str | None:
+    race_references = character.appearance.references.get("race", ())
+    if len(race_references) != 1:
+        return None
+    return race_references[0].target_id
+
+
+def healed_flesh_values(
+    character: CharacterStats,
+    flesh: dict[int, ValueRef],
+) -> dict[int, float]:
+    race_id = character_race_id(character)
+    configured = BODY_HEALTH_RATIOS.get(race_id)
+    ratios = {
+        index: configured[index] if configured is not None and index < len(configured) else 1.0
+        for index in flesh
+    }
+    scale = max(float(ref.value) / ratios[index] for index, ref in flesh.items())
+    if scale <= 0:
+        raise SaveEditError(
+            f"{character.platoon.path}:{character.record.name}: cannot infer "
+            "positive body-part health maximum"
+        )
+    return {index: scale * ratios[index] for index in flesh}
+
+
+def plan_healing_changes(
+    character: CharacterStats,
+) -> tuple[PlannedChange, ...]:
+    medical = character.medical
+    context = f"{character.platoon.path}:{character.record.name}"
+    changes: list[PlannedChange] = []
+
+    dead = medical.values.get("dead")
+    if dead is not None:
+        if dead.kind != "bool":
+            raise SaveEditError(f"{context}: medical field 'dead' is not bool")
+        if bool(dead.value):
+            return ()
+
+    flesh = {
+        int(key.removeprefix("flesh")): ref
+        for key, ref in medical.values.items()
+        if key.startswith("flesh")
+        and key.removeprefix("flesh").isdigit()
+        and ref.kind == "float"
+    }
+    if not flesh:
+        raise SaveEditError(f"{context}: MEDICAL_STATE has no flesh fields")
+
+    maximums = healed_flesh_values(character, flesh)
+
+    def add_change(ref: ValueRef, kind: str, label: str, new_value: int | float) -> None:
+        old_value = int(ref.value) if kind == "bool" else float(ref.value)
+        if old_value == new_value:
+            return
+        if ref.offset is None:
+            raise SaveEditError(f"{context}: {label} has no numeric offset")
+        changes.append(
+            PlannedChange(
+                character.platoon.path,
+                int(ref.offset),
+                kind,
+                f"{character.record.name}.{label}",
+                old_value,
+                new_value,
+            )
+        )
+
+    for index, maximum in maximums.items():
+        add_change(flesh[index], "float", f"flesh{index}", maximum)
+
+    for key, ref in medical.values.items():
+        if ref.kind == "float" and (
+            key in {"bleeding", "KO"}
+            or any(
+                key.startswith(prefix) and key.removeprefix(prefix).isdigit()
+                for prefix in ("bandage", "rig", "stun", "wear")
+            )
+        ):
+            add_change(ref, "float", key, 0.0)
+
+    for key in ("coma", "unconcious", "incapacitated"):
+        ref = medical.values.get(key)
+        if ref is not None:
+            if ref.kind != "bool":
+                raise SaveEditError(f"{context}: medical field {key!r} is not bool")
+            add_change(ref, "bool", key, 0)
+
+    blood = medical.values.get("blood")
+    if blood is not None:
+        if blood.kind != "float":
+            raise SaveEditError(f"{context}: blood is not float")
+        if float(blood.value) < 0:
+            add_change(blood, "float", "blood", 0.0)
+
+    return tuple(changes)
+
+
+def plan_feeding_changes(
+    character: CharacterStats,
+) -> tuple[PlannedChange, ...]:
+    medical = character.medical
+    context = f"{character.platoon.path}:{character.record.name}"
+    dead = medical.values.get("dead")
+    if dead is not None:
+        if dead.kind != "bool":
+            raise SaveEditError(f"{context}: medical field 'dead' is not bool")
+        if bool(dead.value):
+            return ()
+
+    changes: list[PlannedChange] = []
+    for key, new_value in (("hung", 3.0), ("fed", 0.0)):
+        ref = require_value(medical, key, "float", context)
+        old_value = float(ref.value)
+        if old_value == new_value:
+            continue
+        changes.append(
+            PlannedChange(
+                character.platoon.path,
+                int(ref.offset),
+                "float",
+                f"{character.record.name}.{key}",
+                old_value,
+                new_value,
+            )
+        )
+    return tuple(changes)
+
+
+def build_modified_files(
+    snapshot: SaveSnapshot, changes: tuple[PlannedChange, ...]
+) -> dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]]:
+    parsed_by_path = {snapshot.quick_save.path: snapshot.quick_save}
+    parsed_by_path.update(
+        {character.platoon.path: character.platoon for character in snapshot.characters}
+    )
+    grouped: dict[Path, list[PlannedChange]] = {}
+    for change in changes:
+        grouped.setdefault(change.path, []).append(change)
+
+    modified: dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]] = {}
+    for path, file_changes in grouped.items():
+        original = parsed_by_path[path].data
+        output = bytearray(original)
+        allowed_offsets: set[int] = set()
+        for change in file_changes:
+            if change.kind == "int":
+                struct.pack_into("<i", output, change.offset, int(change.new_value))
+                size = 4
+            elif change.kind == "bool":
+                struct.pack_into("<B", output, change.offset, int(change.new_value))
+                size = 1
+            else:
+                struct.pack_into("<f", output, change.offset, float(change.new_value))
+                size = 4
+            allowed_offsets.update(range(change.offset, change.offset + size))
+
+        if len(output) != len(original):
+            raise SaveEditError(f"{path}: file size changed in memory")
+        unexpected = next(
+            (
+                index
+                for index, (before, after) in enumerate(zip(original, output))
+                if before != after and index not in allowed_offsets
+            ),
+            None,
+        )
+        if unexpected is not None:
+            raise SaveEditError(f"{path}: unexpected byte change at {unexpected}")
+
+        reparsed = parse_data_file(path, bytes(output))
+        if reparsed.records_end != parsed_by_path[path].records_end:
+            raise SaveEditError(f"{path}: record boundary changed after patch")
+        for change in file_changes:
+            fmt = {"int": "<i", "bool": "<B", "float": "<f"}[change.kind]
+            actual = struct.unpack_from(fmt, output, change.offset)[0]
+            if change.kind in {"int", "bool"}:
+                matches = actual == int(change.new_value)
+            else:
+                matches = abs(float(actual) - float(change.new_value)) < 0.0001
+            if not matches:
+                raise SaveEditError(
+                    f"{path}: failed in-memory validation for {change.label}"
+                )
+        modified[path] = (original, bytes(output), tuple(file_changes))
+    return modified
+
+
+def create_backup(
+    save_directory: Path,
+    modified: dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]],
+) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup = (
+        Path.home()
+        / ".local/share/kenshi-save-edit/backups"
+        / save_directory.name
+        / timestamp
+    )
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(save_directory, backup)
+    for path, (original, _, _) in modified.items():
+        backup_path = backup / path.relative_to(save_directory)
+        if backup_path.read_bytes() != original:
+            raise SaveEditError(f"backup verification failed: {backup_path}")
+    return backup
+
+
+def prepare_temp_file(path: Path, data: bytes) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.kenshi-save-edit-",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        shutil.copymode(path, temporary)
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    temporary = prepare_temp_file(path, data)
+    try:
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def commit_changes(
+    save_directory: Path,
+    backup: Path,
+    modified: dict[Path, tuple[bytes, bytes, tuple[PlannedChange, ...]]],
+) -> None:
+    for path, (original, _, _) in modified.items():
+        if path.read_bytes() != original:
+            raise SaveEditError(f"{path}: changed after parsing; refusing to overwrite")
+
+    temporary_files: dict[Path, Path] = {}
+    try:
+        for path, (_, output, _) in modified.items():
+            temporary_files[path] = prepare_temp_file(path, output)
+
+        for path, temporary in temporary_files.items():
+            os.replace(temporary, path)
+            fsync_directory(path.parent)
+
+        for path, (_, expected, _) in modified.items():
+            actual = path.read_bytes()
+            if actual != expected:
+                raise SaveEditError(f"{path}: post-write verification failed")
+            parse_data_file(path, actual)
+    except Exception as error:
+        restore_errors: list[str] = []
+        for path in modified:
+            backup_path = backup / path.relative_to(save_directory)
+            try:
+                atomic_write(path, backup_path.read_bytes())
+            except Exception as restore_error:
+                restore_errors.append(f"{path}: {restore_error}")
+        if restore_errors:
+            detail = "; ".join(restore_errors)
+            raise SaveEditError(
+                f"write failed ({error}); backup restore also failed: {detail}"
+            ) from error
+        raise SaveEditError(
+            f"write failed and original files were restored from {backup}: {error}"
+        ) from error
+    finally:
+        for temporary in temporary_files.values():
+            temporary.unlink(missing_ok=True)
+
+
+def build_stat_request(
+    exact_assignments: list[tuple[str, float]],
+    all_stats_exact: float | None,
+    minimum_assignments: list[tuple[str, float]],
+    all_stats_minimum: float | None,
+) -> tuple[dict[str, float], str | None]:
+    has_exact = bool(exact_assignments) or all_stats_exact is not None
+    has_minimum = bool(minimum_assignments) or all_stats_minimum is not None
+    if has_exact and has_minimum:
+        raise SaveEditError(
+            "exact stat options (--stat/--all-stats) cannot be combined with "
+            "minimum stat options (--stat-min/--all-stats-min)"
+        )
+    if not has_exact and not has_minimum:
+        return {}, None
+
+    assignments = exact_assignments if has_exact else minimum_assignments
+    all_value = all_stats_exact if has_exact else all_stats_minimum
+    stats = (
+        {key: float(all_value) for key in OFFICIAL_STATS}
+        if all_value is not None
+        else {}
+    )
+    stats.update(validate_unique_stats(assignments))
+    return stats, "exact" if has_exact else "minimum"
+
+
+def next_automatic_save_name(root: Path, source_name: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    base = f"{source_name}_edited_{timestamp}"
+    candidate = base
+    suffix = 2
+    while (root / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def print_planned_changes(changes: tuple[PlannedChange, ...]) -> None:
+    print("Planned changes:")
+    for change in changes:
+        print(
+            f"  {change.label}: {change.old_value:g} -> {change.new_value:g} "
+            f"({change.path.name}@{change.offset})"
+        )
+
+
+def character_is_dead(character: CharacterStats) -> bool:
+    dead = character.medical.values.get("dead")
+    return bool(dead is not None and dead.kind == "bool" and dead.value)
+
+
+def verify_final_state(
+    snapshot: SaveSnapshot,
+    requested_names: list[str],
+    requested_ids: list[str],
+    requested_platoons: list[str],
+    money: int | None,
+    stats: dict[str, float],
+    stat_mode: str | None,
+    heal: bool,
+    feed: bool,
+    relation_assignments: list[tuple[str, float]],
+) -> None:
+    final_money = require_value(
+        snapshot.camera,
+        "player money",
+        "int",
+        str(snapshot.quick_save.path),
+    )
+    if money is not None and int(final_money.value) != money:
+        raise SaveEditError("final money verification failed")
+
+    for relation, expected in select_faction_relations(
+        snapshot, relation_assignments
+    ):
+        if abs(float(relation.relation.value) - expected) >= 0.0001:
+            raise SaveEditError(
+                f"final relation verification failed for "
+                f"{relation.record.name} [{relation.game_id}]"
+            )
+
+    characters = (
+        select_targets(
+            snapshot,
+            requested_names,
+            requested_ids,
+            requested_platoons,
+        )
+        if stats or heal or feed
+        else ()
+    )
+    for character in characters:
+        for key, requested_value in stats.items():
+            ref = require_value(
+                character.record,
+                key,
+                "float",
+                f"{character.platoon.path}:{character.record.name}",
+            )
+            actual = float(ref.value)
+            valid = (
+                actual + 0.0001 >= requested_value
+                if stat_mode == "minimum"
+                else abs(actual - requested_value) < 0.0001
+            )
+            if not valid:
+                raise SaveEditError(
+                    f"final verification failed for {character.record.name}.{key}"
+                )
+
+        dead = character_is_dead(character)
+        if feed and not dead:
+            medical = character.medical
+            for key, expected in (("hung", 3.0), ("fed", 0.0)):
+                ref = require_value(
+                    medical,
+                    key,
+                    "float",
+                    f"{character.platoon.path}:{character.record.name}",
+                )
+                if abs(float(ref.value) - expected) >= 0.0001:
+                    raise SaveEditError(
+                        f"final feeding verification failed for "
+                        f"{character.record.name}.{key}"
+                    )
+
+        if not heal or dead:
+            continue
+        medical = character.medical.values
+        for key, ref in medical.items():
+            is_damage = ref.kind == "float" and (
+                key in {"bleeding", "KO"}
+                or any(
+                    key.startswith(prefix) and key.removeprefix(prefix).isdigit()
+                    for prefix in ("bandage", "rig", "stun", "wear")
+                )
+            )
+            if is_damage and abs(float(ref.value)) >= 0.0001:
+                raise SaveEditError(
+                    f"final healing verification failed for "
+                    f"{character.record.name}.{key}"
+                )
+        for key in ("coma", "unconcious", "incapacitated"):
+            ref = medical.get(key)
+            if ref is not None and bool(ref.value):
+                raise SaveEditError(
+                    f"final healing verification failed for "
+                    f"{character.record.name}.{key}"
+                )
+        flesh = {
+            int(key.removeprefix("flesh")): ref
+            for key, ref in medical.items()
+            if key.startswith("flesh")
+            and key.removeprefix("flesh").isdigit()
+            and ref.kind == "float"
+        }
+        expected_flesh = healed_flesh_values(character, flesh)
+        for index, expected in expected_flesh.items():
+            if abs(float(flesh[index].value) - expected) >= 0.0001:
+                raise SaveEditError(
+                    f"final healing verification failed for "
+                    f"{character.record.name}.flesh{index}"
+                )
+        blood = medical.get("blood")
+        if blood is not None and float(blood.value) < -0.0001:
+            raise SaveEditError(
+                f"final healing verification failed for {character.record.name}.blood"
+            )
+
+
+def command_set(
+    root: Path,
+    save_name: str,
+    copy_as: str | None,
+    in_place: bool,
+    allow_running_in_place: bool,
+    dry_run: bool,
+    requested_names: list[str],
+    requested_ids: list[str],
+    requested_platoons: list[str],
+    money: int | None,
+    exact_assignments: list[tuple[str, float]],
+    all_stats_exact: float | None,
+    minimum_assignments: list[tuple[str, float]],
+    all_stats_minimum: float | None,
+    heal: bool,
+    feed: bool,
+    relation_assignments: list[tuple[str, float]],
+) -> None:
+    running = find_running_kenshi_processes()
+    if copy_as is not None and in_place:
+        raise SaveEditError("--copy-as and --in-place cannot be used together")
+    if allow_running_in_place and not in_place:
+        raise SaveEditError(
+            "--allow-running-in-place requires --in-place"
+        )
+    if running and in_place and not allow_running_in_place:
+        details = "\n".join(f"  PID {pid}: {command}" for pid, command in running)
+        raise SaveEditError(
+            "Kenshi or FCS is running; omit --in-place to create a safe copy, "
+            "or explicitly use --allow-running-in-place:\n"
+            + details
+        )
+    if money is not None and not 0 <= money <= MAX_MONEY:
+        raise SaveEditError(f"money must be between 0 and {MAX_MONEY}")
+
+    stats, stat_mode = build_stat_request(
+        exact_assignments,
+        all_stats_exact,
+        minimum_assignments,
+        all_stats_minimum,
+    )
+    if money is None and not stats and not heal and not feed and not relation_assignments:
+        raise SaveEditError(
+            "nothing to change: provide --money, stat options, --heal, --feed, "
+            "and/or --relation"
+        )
+
+    source_directory = resolve_save_directory(root, save_name)
+    source_snapshot = load_snapshot(source_directory)
+    if stats or heal or feed:
+        targets = select_targets(
+            source_snapshot,
+            requested_names,
+            requested_ids,
+            requested_platoons,
+        )
+        if not targets:
+            raise SaveEditError(
+                "--character, --character-id, or --platoon is required when "
+                "changing stats, health, or hunger"
+            )
+    elif requested_names or requested_ids or requested_platoons:
+        raise SaveEditError(
+            "character selectors require stat changes, --heal, or --feed"
+        )
+
+    source_characters = (
+        select_targets(
+            source_snapshot,
+            requested_names,
+            requested_ids,
+            requested_platoons,
+        )
+        if stats or heal or feed
+        else ()
+    )
+    skipped_dead_targets = (
+        [character for character in source_characters if character_is_dead(character)]
+        if heal or feed
+        else []
+    )
+    for character in skipped_dead_targets:
+        print(f"Skipped dead character: {character_description(character)}")
+
+    source_changes = plan_changes(
+        source_snapshot,
+        source_characters,
+        money,
+        stats,
+        stat_mode,
+        heal,
+        feed,
+        relation_assignments,
+    )
+    if not source_changes:
+        print("No changes needed; no backup was created.")
+        return
+
+    output_name = (
+        source_directory.name
+        if in_place
+        else copy_as or next_automatic_save_name(root, source_directory.name)
+    )
+    if not in_place:
+        resolve_new_save_directory(root, output_name)
+
+    print_planned_changes(source_changes)
+    print(
+        f"Output: {output_name}"
+        + (" (in place)" if in_place else " (new save)")
+    )
+    build_modified_files(source_snapshot, source_changes)
+    if dry_run:
+        print("Dry run complete; no files were copied or changed.")
+        return
+
+    created_copy = not in_place
+    if created_copy:
+        save_directory = root / output_name
+        copy_stable_save(source_directory, save_directory)
+        print(f"Copy: {source_directory.name} -> {save_directory.name}")
+    else:
+        save_directory = source_directory
+
+    snapshot = load_snapshot(save_directory)
+    characters = (
+        select_targets(
+            snapshot,
+            requested_names,
+            requested_ids,
+            requested_platoons,
+        )
+        if stats or heal or feed
+        else ()
+    )
+    changes = plan_changes(
+        snapshot,
+        characters,
+        money,
+        stats,
+        stat_mode,
+        heal,
+        feed,
+        relation_assignments,
+    )
+    if not changes:
+        if created_copy:
+            shutil.rmtree(save_directory)
+        print("No changes needed; no save copy or backup was kept.")
+        return
+
+    modified = build_modified_files(snapshot, changes)
+    backup = create_backup(save_directory, modified)
+    commit_changes(save_directory, backup, modified)
+
+    final_snapshot = load_snapshot(save_directory)
+    verify_final_state(
+        final_snapshot,
+        requested_names,
+        requested_ids,
+        requested_platoons,
+        money,
+        stats,
+        stat_mode,
+        heal,
+        feed,
+        relation_assignments,
+    )
+
+    print(f"Save: {save_directory}")
+    print(f"Backup: {backup}")
+    print("Changes applied and verified.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kenshi-save-edit",
+        description=(
+            "Safely edit Kenshi money, faction relations, character stats, "
+            "medical state, and hunger."
+        ),
+    )
+    parser.add_argument(
+        "--save-root",
+        help="override the automatically discovered Kenshi save directory",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser(
+        "list", help="show money and player character stats"
+    )
+    list_parser.add_argument("--save", required=True, help="save directory name")
+    list_parser.add_argument(
+        "--platoon",
+        action="append",
+        default=[],
+        help="show only this player platoon; repeat for multiple platoons",
+    )
+    list_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show stable character record IDs",
+    )
+
+    relations_parser = subparsers.add_parser(
+        "relations", help="show player relations with every faction"
+    )
+    relations_parser.add_argument("--save", required=True, help="save directory name")
+
+    set_parser = subparsers.add_parser(
+        "set", help="back up a save and immediately apply changes"
+    )
+    set_parser.add_argument("--save", required=True, help="save directory name")
+    set_parser.add_argument(
+        "--copy-as",
+        help=(
+            "use this name for the edited copy instead of an automatic name"
+        ),
+    )
+    set_parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="edit --save itself instead of creating a new save",
+    )
+    set_parser.add_argument(
+        "--allow-running-in-place",
+        action="store_true",
+        help=(
+            "edit --save in place while Kenshi is running; use only when the "
+            "save is not being written and reload it afterwards"
+        ),
+    )
+    set_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and show changes without copying or writing files",
+    )
+    target_group = set_parser.add_mutually_exclusive_group()
+    target_group.add_argument(
+        "--character",
+        action="append",
+        default=[],
+        help="character name; repeat to edit multiple characters",
+    )
+    target_group.add_argument(
+        "--character-id",
+        action="append",
+        default=[],
+        help="full or numeric character record ID; repeat for multiple characters",
+    )
+    target_group.add_argument(
+        "--platoon",
+        action="append",
+        default=[],
+        help="player platoon name; edits every character in it",
+    )
+    set_parser.add_argument("--money", type=int, help="set the total player balance")
+    set_parser.add_argument(
+        "--relation",
+        "--reputation",
+        action="append",
+        default=[],
+        type=parse_relation_assignment,
+        metavar="FACTION=VALUE",
+        help=(
+            "set relation with a faction by exact name or gamedata ID; "
+            "repeat for multiple factions"
+        ),
+    )
+    set_parser.add_argument(
+        "--stat",
+        action="append",
+        default=[],
+        type=parse_stat_assignment,
+        metavar="NAME=VALUE",
+        help="set a stat exactly; repeat for multiple stats",
+    )
+    set_parser.add_argument(
+        "--all-stats",
+        type=parse_stat_minimum,
+        metavar="VALUE",
+        help="set all 33 user-facing skills from fcs.def exactly",
+    )
+    set_parser.add_argument(
+        "--stat-min",
+        action="append",
+        default=[],
+        type=parse_stat_assignment,
+        metavar="NAME=VALUE",
+        help="raise a stat to at least VALUE; repeat for multiple stats",
+    )
+    set_parser.add_argument(
+        "--all-stats-min",
+        type=parse_stat_minimum,
+        metavar="VALUE",
+        help="raise all 33 user-facing skills from fcs.def to at least VALUE",
+    )
+    set_parser.add_argument(
+        "--heal",
+        action="store_true",
+        help="fully heal selected characters without changing lost-limb metadata",
+    )
+    set_parser.add_argument(
+        "--feed",
+        action="store_true",
+        help="fully feed living selected characters",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        root = discover_save_root(arguments.save_root)
+        if arguments.command == "list":
+            command_list(
+                root,
+                arguments.save,
+                arguments.platoon,
+                arguments.verbose,
+            )
+        elif arguments.command == "relations":
+            command_relations(root, arguments.save)
+        else:
+            command_set(
+                root,
+                arguments.save,
+                arguments.copy_as,
+                arguments.in_place,
+                arguments.allow_running_in_place,
+                arguments.dry_run,
+                arguments.character,
+                arguments.character_id,
+                arguments.platoon,
+                arguments.money,
+                arguments.stat,
+                arguments.all_stats,
+                arguments.stat_min,
+                arguments.all_stats_min,
+                arguments.heal,
+                arguments.feed,
+                arguments.relation,
+            )
+        return 0
+    except SaveEditError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
